@@ -1,70 +1,38 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 import time
-import torch
-from Utils.io_utils import write_args, save_config_to_yaml
 
+class Logger:
+    def __init__(self, save_dir):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
 
-class Logger(object):
-    def __init__(self, args):
-        self.args = args
-        self.save_dir = args.save_dir
-        
-        os.makedirs(self.save_dir, exist_ok=True)
-            
-        # save the args and config
-        self.config_dir = os.path.join(self.save_dir, 'configs')
-        os.makedirs(self.config_dir, exist_ok=True)
-        file_name = os.path.join(self.config_dir, 'args.txt')
-        write_args(args, file_name)
+        log_path = os.path.join(save_dir, "log.txt")
+        self.log_file = open(log_path, "a")
 
-        log_dir = os.path.join(self.save_dir, 'logs')
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-        self.text_writer = open(os.path.join(log_dir, 'log.txt'), 'a') # 'w')
-        if args.tensorboard:
-            self.log_info('using tensorboard')
-            self.tb_writer = torch.utils.tensorboard.SummaryWriter(log_dir=log_dir) # tensorboard.SummaryWriter(log_dir=log_dir)
-        else:
-            self.tb_writer = None
-            
+    def log_info(self, msg):
+        """
+        Log text information with timestamp.
+        """
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{time_str}] {msg}"
+        print(line)
+        self.log_file.write(line + "\n")
+        self.log_file.flush()
+
+    def add_scalar(self, tag, scalar_value, global_step):
+        """
+        Log scalar values (e.g., loss) to text log.
+        """
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{time_str}] {tag} | step={global_step} | value={scalar_value:.6f}"
+        self.log_file.write(line + "\n")
+        self.log_file.flush()
+
     def save_config(self, config):
-        save_config_to_yaml(config, os.path.join(self.config_dir, 'config.yaml'))
-
-    def log_info(self, info, check_primary=True):
-        print(info)
-        info = str(info)
-        time_str = time.strftime('%Y-%m-%d-%H-%M')
-        info = '{}: {}'.format(time_str, info)
-        if not info.endswith('\n'):
-            info += '\n'
-        self.text_writer.write(info)
-        self.text_writer.flush()
-
-    def add_scalar(self, **kargs):
-        """Log a scalar variable."""
-        if self.tb_writer is not None:
-            self.tb_writer.add_scalar(**kargs)
-
-    def add_scalars(self, **kargs):
-        """Log a scalar variable."""
-        if self.tb_writer is not None:
-            self.tb_writer.add_scalars(**kargs)
-
-    def add_image(self, **kargs):
-        """Log a scalar variable."""
-        if self.tb_writer is not None:
-            self.tb_writer.add_image(**kargs)
-
-    def add_images(self, **kargs):
-        """Log a scalar variable."""
-        if self.tb_writer is not None:
-            self.tb_writer.add_images(**kargs)
+        import yaml
+        path = os.path.join(self.save_dir, "config.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump(config, f)
 
     def close(self):
-        self.text_writer.close()
-        self.tb_writer.close()
-
+        self.log_file.close()

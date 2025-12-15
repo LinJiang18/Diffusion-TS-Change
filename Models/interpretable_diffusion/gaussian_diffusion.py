@@ -41,7 +41,8 @@ class Diffusion_TS(nn.Module):
             n_layer_dec=6,
             d_model=None,
             timesteps=1000,
-            sampling_timesteps=None,
+            sampling_timesteps = 50,
+            fast_sampling=False,
             loss_type='l1',
             beta_schedule='cosine',
             n_heads=4,
@@ -60,6 +61,7 @@ class Diffusion_TS(nn.Module):
         self.eta, self.use_ff = eta, use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
+        self.fast_sampling = fast_sampling
         self.ff_weight = default(reg_weight, math.sqrt(self.seq_length) / 5)
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
@@ -77,17 +79,19 @@ class Diffusion_TS(nn.Module):
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
 
-        timesteps, = betas.shape
+#        timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
         # sampling related parameters
 
-        self.sampling_timesteps = default(
-            sampling_timesteps, timesteps)  # default num sampling timesteps to number of timesteps at training
+        if self.fast_sampling:
+            self.sampling_timesteps = sampling_timesteps
+        else:
+            self.sampling_timesteps = timesteps
+        # default num sampling timesteps to number of timesteps at training
 
         assert self.sampling_timesteps <= timesteps
-        self.fast_sampling = self.sampling_timesteps < timesteps
 
         # helper function to register buffer from float64 to float32
 

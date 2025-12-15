@@ -29,14 +29,18 @@ class Trainer(object):
         self.train_num_steps = config['solver']['max_epochs']
         self.gradient_accumulate_every = config['solver']['gradient_accumulate_every']
         self.save_cycle = config['solver']['save_cycle']
-        self.dl = cycle(dataloader['dataloader'])
-        self.dataloader = dataloader['dataloader']
+        self.dl = cycle(dataloader)
+        self.dataloader = dataloader
         self.step = 0
         self.milestone = 0
         self.args, self.config = args, config
         self.logger = logger
 
-        self.results_folder = Path(config['solver']['results_folder'] + f'_{model.seq_length}')
+        base = config['solver']['results_folder']
+        name = args.name
+        seq_len = config['model']['params']['seq_length']
+
+        self.results_folder = Path(f"{base}_{name}_{seq_len}")
         os.makedirs(self.results_folder, exist_ok=True)
 
         start_lr = config['solver'].get('base_lr', 1.0e-4)
@@ -64,15 +68,7 @@ class Trainer(object):
             'opt': self.opt.state_dict(),
         }
         torch.save(data, str(self.results_folder / f'checkpoint-{milestone}.pt'))
-    
-    def save_classifier(self, milestone, verbose=False):
-        if self.logger is not None and verbose:
-            self.logger.log_info('Save current classifer to {}'.format(str(self.results_folder / f'ckpt_classfier-{milestone}.pt')))
-        data = {
-            'step': self.step_classifier,
-            'classifier': self.classifier.state_dict()
-        }
-        torch.save(data, str(self.results_folder / f'ckpt_classfier-{milestone}.pt'))
+
 
     def load(self, milestone, verbose=False):
         if self.logger is not None and verbose:
@@ -85,21 +81,13 @@ class Trainer(object):
         self.ema.load_state_dict(data['ema'])
         self.milestone = milestone
 
-    def load_classifier(self, milestone, verbose=False):
-        if self.logger is not None and verbose:
-            self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'ckpt_classfier-{milestone}.pt')))
-        device = self.device
-        data = torch.load(str(self.results_folder / f'ckpt_classfier-{milestone}.pt'), map_location=device)
-        self.classifier.load_state_dict(data['classifier'])
-        self.step_classifier = data['step']
-        self.milestone_classifier = milestone
 
     def train(self):
         device = self.device
         step = 0
         if self.logger is not None:
             tic = time.time()
-            self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
+            self.logger.log_info('{}: start training...'.format(self.args.name))
 
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
@@ -143,20 +131,39 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
+    def sample(self, num_samples, batch_size, model_kwargs=None, cond_fn=None):
+        """
+        Generate samples using EMA model.
+        Only generate full batches; drop the remainder if not divisible.
+        """
         if self.logger is not None:
             tic = time.time()
-            self.logger.log_info('Begin to sample...')
-        samples = np.empty([0, shape[0], shape[1]])
-        num_cycle = int(num // size_every) + 1
+            self.logger.log_info(
+                f"Begin sampling {num_samples} samples "
+                f"(batch_size={batch_size}"
+            )
 
-        for _ in range(num_cycle):
-            sample = self.ema.ema_model.generate_mts(batch_size=size_every, model_kwargs=model_kwargs, cond_fn=cond_fn)
-            samples = np.row_stack([samples, sample.detach().cpu().numpy()])
-            torch.cuda.empty_cache()
+        num_batches = num_samples // batch_size
+        all_samples = []
+
+        for _ in range(num_batches):
+            with torch.no_grad():
+                sample = self.ema.ema_model.generate_mts(
+                    batch_size=batch_size,
+                    model_kwargs=model_kwargs,
+                    cond_fn=cond_fn
+                )
+
+            all_samples.append(sample.detach().cpu().numpy())
+
+        samples = np.concatenate(all_samples, axis=0)
 
         if self.logger is not None:
-            self.logger.log_info('Sampling done, time: {:.2f}'.format(time.time() - tic))
+            self.logger.log_info(
+                f"Sampling done, generated {samples.shape[0]} samples, "
+                f"time: {time.time() - tic:.2f}s"
+            )
+
         return samples
 
     def restore(self, raw_dataloader, shape=None, coef=1e-1, stepsize=1e-1, sampling_steps=50):
@@ -187,6 +194,38 @@ class Trainer(object):
             self.logger.log_info('Imputation done, time: {:.2f}'.format(time.time() - tic))
         return samples, reals, masks
         # return samples
+
+    def n_sample(self, n, shape, coef=1e-1, stepsize=1e-1, sampling_steps=50):
+        if self.logger is not None:
+            tic = time.time()
+            self.logger.log_info('Begin to restore...')
+
+        model_kwargs = {}
+        model_kwargs['coef'] = coef
+        model_kwargs['learning_rate'] = stepsize
+
+        # 目标生成的张量形状： (n, shape[0], shape[1])
+        sample_shape = (n, shape[0], shape[1])
+
+        # 从纯噪声开始生成，不再使用 in-fill，也不需要 mask/target
+        if sampling_steps == self.model.num_timesteps:
+            samples = self.ema.ema_model.sample(
+                shape=sample_shape,
+                model_kwargs=model_kwargs
+            )
+        else:
+            samples = self.ema.ema_model.fast_sample(
+                shape=sample_shape,
+                model_kwargs=model_kwargs,
+                sampling_timesteps=sampling_steps
+            )
+
+        samples = samples.detach().cpu().numpy()
+
+        if self.logger is not None:
+            self.logger.log_info('Sampling done, time: {:.2f}'.format(time.time() - tic))
+
+        return samples
 
     def forward_sample(self, x_start):
        b, c, h = x_start.shape
