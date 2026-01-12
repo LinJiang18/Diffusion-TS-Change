@@ -363,19 +363,25 @@ class Decoder(nn.Module):
       
     def forward(self, x, t, enc, padding_masks=None, label_emb=None):
         b, c, _ = x.shape
-        # att_weights = []
-        mean = []
-        season = torch.zeros((b, c, self.d_model), device=x.device)
-        trend = torch.zeros((b, c, self.n_feat), device=x.device)
-        for block_idx in range(len(self.blocks)):
-            x, residual_mean, residual_trend, residual_season = \
-                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
-            season += residual_season
-            trend += residual_trend
-            mean.append(residual_mean)
 
-        mean = torch.cat(mean, dim=1)
-        return x, mean, trend, season
+        mean_list = []
+        season_layers = []
+        trend_layers = []
+
+        for block in self.blocks:
+            x, residual_mean, residual_trend, residual_season = \
+                block(x, enc, t, mask=padding_masks, label_emb=label_emb)
+
+            mean_list.append(residual_mean)
+            trend_layers.append(residual_trend)  # (B, T, n_feat)
+            season_layers.append(residual_season)  # (B, T, d_model)
+
+        mean = torch.cat(mean_list, dim=1)
+
+        trend_layers = torch.stack(trend_layers, dim=1)  # (B, L, T, n_feat)
+        season_layers = torch.stack(season_layers, dim=1)  # (B, L, T, d_model)
+
+        return x, mean, trend_layers, season_layers
 
 
 class Transformer(nn.Module):
@@ -425,17 +431,48 @@ class Transformer(nn.Module):
         enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
 
         inp_dec = self.pos_dec(emb)
-        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
+        output, mean, trend_layers, season_layers = self.decoder(
+            inp_dec, t, enc_cond, padding_masks=padding_masks)
 
-        res = self.inverse(output)
-        res_m = torch.mean(res, dim=1, keepdim=True)
-        season_error = self.combine_s(season.transpose(1, 2)).transpose(1, 2) + res - res_m
-        trend = self.combine_m(mean) + res_m + trend
+        # Sum across layers to recover original aggregated components
+        trend_sum = trend_layers.sum(dim=1)  # (B, T, n_feat)
+        season_sum = season_layers.sum(dim=1)  # (B, T, d_model)
 
-        if return_res:
-            return trend, self.combine_s(season.transpose(1, 2)).transpose(1, 2), res - res_m
+        # Residual branch
+        res = self.inverse(output)  # (B, T, n_feat)
+        res_m = torch.mean(res, dim=1, keepdim=True)  # (B, 1, n_feat)
 
-        return trend, season_error
+        # Project aggregated season back to feature space, keep original logic
+        season_proj = self.combine_s(season_sum.transpose(1, 2)).transpose(1, 2)  # (B, T, n_feat)
+        season_error = season_proj + (res - res_m)  # (B, T, n_feat)
+
+        # Final trend, keep original logic
+        trend = self.combine_m(mean) + res_m + trend_sum  # (B, T, n_feat)
+
+        # ---------- Layer-wise season projection for visualization ----------
+
+        B, L, T, D = season_layers.shape
+
+        # (1) per-layer increment, projected: combine_s(season_l)
+        season_inc_flat = season_layers.reshape(B * L, T, D)  # (B*L, T, d_model)
+        season_inc_proj_flat = self.combine_s(
+            season_inc_flat.transpose(1, 2)  # (B*L, d_model, T)
+        ).transpose(1, 2)  # (B*L, T, n_feat)
+        season_inc_proj = season_inc_proj_flat.reshape(B, L, T, -1)  # (B, L, T, n_feat)
+
+        # (2) per-layer cumulative, projected: combine_s(sum_{i<=l} season_i)
+        season_cum = season_layers.cumsum(dim=1)  # (B, L, T, d_model)
+        season_cum_flat = season_cum.reshape(B * L, T, D)  # (B*L, T, d_model)
+        season_cum_proj_flat = self.combine_s(
+            season_cum_flat.transpose(1, 2)  # (B*L, d_model, T)
+        ).transpose(1, 2)  # (B*L, T, n_feat)
+        season_cum_proj = season_cum_proj_flat.reshape(B, L, T, -1)  # (B, L, T, n_feat)
+
+        # ---------- Optional: layer-wise trend cumulative (no projection needed) ----------
+        trend_cum = trend_layers.cumsum(dim=1)  # (B, L, T, n_feat)
+
+        # Return everything you need for visualization/debug
+        return trend,season_error,trend_cum,season_cum_proj
 
 
 if __name__ == '__main__':

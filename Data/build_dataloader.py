@@ -73,26 +73,16 @@ def build_dataloader(config, args):
     scaler = MinMaxScaler()
     scaler.fit(data)
 
-    joblib.dump(
-        scaler,
-        os.path.join(args.output_dir, "scaler.pkl")
-    )
 
     normalizer = Normalizer(scaler, auto_norm=True)
-
-    # -------- split unnormalized data --------
     origin_unnorm = split_to_chunks(data, seq_length)   # (N, L, C)
-
-    # -------- normalize full sequence --------
     data_norm = normalizer.normalize(data)               # (M, C)
-
-    # -------- split normalized data --------
     origin_norm = split_to_chunks(data_norm, seq_length) # (N, L, C)
 
     # -------- save both --------
     os.makedirs(args.output_dir, exist_ok=True)
-    np.save(os.path.join(args.output_dir, "origin_data_unnorm.npy"), origin_unnorm)
-    np.save(os.path.join(args.output_dir, "origin_data_norm.npy"), origin_norm)
+    np.save(os.path.join(args.output_dir, f"origin_data_unnorm_{args.name}.npy"), origin_unnorm)
+    np.save(os.path.join(args.output_dir, f"origin_data_norm_{args.name}.npy"), origin_norm)
 
     # -------- training dataset uses normalized data --------
     dataset = SplitWindowDataset(data_norm, seq_length)
@@ -104,6 +94,20 @@ def build_dataloader(config, args):
         drop_last=True
     )
 
-    return dataloader
+    return {"dataloader": dataloader, "normalizer": normalizer, "scaler": scaler}
 
+
+def unnormalize_sample(samples: np.ndarray, normalizer) -> np.ndarray:
+    """
+    samples: np.ndarray, shape (B, T, 1)
+    normalizer: instance of Normalizer(scaler, auto_norm=...)
+    return: np.ndarray, shape (B, T, 1) in original scale
+    """
+    samples = np.asarray(samples)
+    assert samples.ndim == 3 , f"expected dim = 3"
+
+    B, T, C = samples.shape
+    x2d = samples.reshape(B * T, C)
+    x2d = normalizer.unnormalize(x2d)
+    return x2d.reshape(B, T, C)
 

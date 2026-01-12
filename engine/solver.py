@@ -131,7 +131,7 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num_samples, batch_size, model_kwargs=None, cond_fn=None):
+    def sample(self, num_samples, batch_size):
         """
         Generate samples using EMA model.
         Only generate full batches; drop the remainder if not divisible.
@@ -149,9 +149,7 @@ class Trainer(object):
         for _ in range(num_batches):
             with torch.no_grad():
                 sample = self.ema.ema_model.generate_mts(
-                    batch_size=batch_size,
-                    model_kwargs=model_kwargs,
-                    cond_fn=cond_fn
+                    batch_size=batch_size
                 )
 
             all_samples.append(sample.detach().cpu().numpy())

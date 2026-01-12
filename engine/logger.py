@@ -1,5 +1,7 @@
 import os
 import time
+import torch
+import numpy as np
 
 class Logger:
     def __init__(self, save_dir):
@@ -36,3 +38,50 @@ class Logger:
 
     def close(self):
         self.log_file.close()
+
+
+class DecompTrace:
+    def __init__(self, dtype="float16"):
+        self.dtype = dtype
+        self.data = {}  # t -> {"trend_cum": np.ndarray, "season_cum": np.ndarray}
+
+    @torch.no_grad()
+    def log(self, t, img, trend_cum, season_cum):
+        t_int = int(t.flatten()[0].item()) if torch.is_tensor(t) else int(t)
+
+        img = img.detach().cpu().numpy()
+        tc = trend_cum.detach().cpu().numpy()
+        sc = season_cum.detach().cpu().numpy()
+
+        if self.dtype is not None:
+            img = img.astype(self.dtype, copy=False)
+            tc = tc.astype(self.dtype, copy=False)
+            sc = sc.astype(self.dtype, copy=False)
+
+        self.data[t_int] = {"img": img, "trend_cum": tc, "season_cum": sc}
+
+
+
+def save_trace_npz(trace, path):
+    ts = sorted(trace.data.keys())
+    save_dict = {"t": np.array(ts, dtype=np.int32)}
+
+    for t in ts:
+        save_dict[f"img/{t}"] = trace.data[t]["img"]
+        save_dict[f"trend_cum/{t}"] = trace.data[t]["trend_cum"]
+        save_dict[f"season_cum/{t}"] = trace.data[t]["season_cum"]
+
+    np.savez_compressed(path, **save_dict)
+
+
+def load_trace_npz(path):
+    z = np.load(path, allow_pickle=False)
+    ts = list(z["t"].astype(int))
+    data = {}
+    for t in ts:
+        data[t] = {
+            "img": z[f"img/{t}"],
+            "trend_cum": z[f"trend_cum/{t}"],
+            "season_cum": z[f"season_cum/{t}"],
+        }
+    return data

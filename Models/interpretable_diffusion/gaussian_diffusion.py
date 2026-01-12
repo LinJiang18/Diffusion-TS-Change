@@ -10,7 +10,8 @@ from Models.interpretable_diffusion.transformer import Transformer
 from Models.interpretable_diffusion.model_utils import default, identity, extract
 
 
-# gaussian diffusion trainer class
+
+# gaussian diffusion class
 
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
@@ -50,18 +51,42 @@ class Diffusion_TS(nn.Module):
             eta=0.,
             attn_pd=0.,
             resid_pd=0.,
+            mode = True,
             kernel_size=None,
             padding_size=None,
             use_ff=True,
             reg_weight=None,
+
+            heavy=False,
+            heavy_nu=8.0,
+            heavy_var_correction=True,
+
+            # sanity check
+            sanity_prob=0.002,
+            sanity_quantile=0.999,
+            sanity_compare_ref=True,
+            sanity_check_xt=True,
+
             **kwargs
     ):
         super(Diffusion_TS, self).__init__()
+
+
+        self.heavy = bool(heavy)
+        self.heavy_nu = float(heavy_nu)
+        self.heavy_var_correction = bool(heavy_var_correction)
+        self.sanity_prob = float(sanity_prob)
+        self.sanity_quantile = float(sanity_quantile)
+        self.sanity_compare_ref = bool(sanity_compare_ref)
+        self.sanity_check_xt = bool(sanity_check_xt)
+
 
         self.eta, self.use_ff = eta, use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
         self.fast_sampling = fast_sampling
+        self.mode = mode
+        self._trace = None
         self.ff_weight = default(reg_weight, math.sqrt(self.seq_length) / 5)
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
@@ -127,6 +152,9 @@ class Diffusion_TS(nn.Module):
         
         register_buffer('loss_weight', torch.sqrt(alphas) * torch.sqrt(1. - alphas_cumprod) / betas / 100)
 
+    def set_trace(self, trace):
+        self._trace = trace
+
     def predict_noise_from_start(self, x_t, t, x0):
         return (
                 (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
@@ -147,10 +175,14 @@ class Diffusion_TS(nn.Module):
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
-    
+
     def output(self, x, t, padding_masks=None):
-        trend, season = self.model(x, t, padding_masks=padding_masks)
+        trend, season, trend_cum, season_cum = self.model(x, t, padding_masks=padding_masks)
         model_output = trend + season
+
+        if getattr(self, "_trace", None) is not None and (not self.mode):  # sample process
+            self._trace.log(t, model_output, trend_cum, season_cum)
+
         return model_output
 
     def model_predictions(self, x, t, clip_x_start=False, padding_masks=None):
@@ -170,24 +202,25 @@ class Diffusion_TS(nn.Module):
         model_mean, posterior_variance, posterior_log_variance = \
             self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
-    
-    def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None):
+
+    def p_sample(self, x, t: int, clip_denoised=True):
         b, *_, device = *x.shape, self.betas.device
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
+
         model_mean, _, model_log_variance, x_start = \
             self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised)
-        noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
-        if cond_fn is not None:
-            model_mean = self.condition_mean(
-                cond_fn, model_mean, model_log_variance, x, t=batched_times, model_kwargs=model_kwargs
-            )
+
+        noise = torch.randn_like(x) if t > 0 else 0.0
         pred_series = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_series, x_start
 
     @torch.no_grad()
     def sample(self, shape):
         device = self.betas.device
+
+        # route A recommended: keep sampling Gaussian
         img = torch.randn(shape, device=device)
+
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
             img, _ = self.p_sample(img, t)
@@ -224,11 +257,8 @@ class Diffusion_TS(nn.Module):
 
         return img
     
-    def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None):
+    def generate_mts(self, batch_size=16):
         feature_size, seq_length = self.feature_size, self.seq_length
-        if cond_fn is not None:
-            sample_fn = self.fast_sample_cond if self.fast_sampling else self.sample_cond
-            return sample_fn((batch_size, seq_length, feature_size), model_kwargs=model_kwargs, cond_fn=cond_fn)
         sample_fn = self.fast_sample if self.fast_sampling else self.sample
         return sample_fn((batch_size, seq_length, feature_size))
 
@@ -249,27 +279,135 @@ class Diffusion_TS(nn.Module):
         )
 
     def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
+        """
+        Heavy-tailed (optional) DDPM training loss with debug/sanity checks.
+        - x0-prediction loss (plus optional Fourier loss)
+        - Heavy-tailed noise: Student-t via Gaussian scale mixture (GSM) when self.heavy=True
+        - q_sample unchanged; only training-time noise changes
+        """
+
+        # -------------------------
+        # Config knobs
+        # -------------------------
+        heavy = bool(getattr(self, "heavy", False))
+        nu = float(getattr(self, "heavy_nu", 8.0))
+        heavy_var_correction = bool(getattr(self, "heavy_var_correction", True))
+
+        # Sanity-check knobs (apply to BOTH heavy and gaussian)
+        sanity_prob = float(getattr(self, "sanity_prob", 0.002))  # printing probability
+        sanity_q = float(getattr(self, "sanity_quantile", 0.999))  # tail quantile
+        sanity_compare_ref = bool(getattr(self, "sanity_compare_ref", True))  # compare with gaussian reference
+        sanity_check_xt = bool(getattr(self, "sanity_check_xt", True))  # also check x_t tails
+
+        # -------------------------
+        # (A) Sample noise for q_sample
+        # -------------------------
+        if noise is None:
+            if heavy:
+                if nu <= 2.0:
+                    raise ValueError(f"heavy_nu must be > 2, got {nu}")
+
+                # Student-t noise via GSM: z / sqrt(kappa/nu)
+                z = torch.randn_like(x_start)
+                B = x_start.shape[0]
+                kappa = torch.distributions.Chi2(df=nu).sample((B,)).to(
+                    device=x_start.device, dtype=x_start.dtype
+                )
+                scale = torch.sqrt(kappa / nu).view((B,) + (1,) * (x_start.ndim - 1))
+                noise = z / scale
+
+                # Optional: variance-correct to unit variance so DDPM coefficients keep meaning
+                # Var(t_nu) = nu/(nu-2) => multiply by sqrt((nu-2)/nu)
+                if heavy_var_correction:
+                    noise = noise * math.sqrt((nu - 2.0) / nu)
+            else:
+                noise = torch.randn_like(x_start)
+
+        # Target is x0 for x0-prediction
         if target is None:
             target = x_start
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
-        model_out = self.output(x, t, padding_masks)
+        # -------------------------
+        # (B) Create x_t via q_sample (unchanged)
+        # -------------------------
+        x = self.q_sample(x_start=x_start, t=t, noise=noise)
 
+        # =========================
+        # SANITY CHECK (DEBUG ONLY)
+        # Apply to BOTH heavy and gaussian, so you can directly compare runs.
+        # You can delete this whole block later.
+        # =========================
+        if sanity_prob > 0 and torch.rand((), device=x_start.device) < sanity_prob:
+            with torch.no_grad():
+                mode = "HEAVY" if heavy else "GAUSS"
+
+                # (1) Element-wise tail of the actual noise used (global across batch)
+                abs_noise_all = noise.detach().abs().reshape(-1)
+                noise_tail = abs_noise_all.quantile(sanity_q)
+
+                msg = f"[sanity:{mode}] q={sanity_q:.3f} |noise|_q(all)={float(noise_tail):.6g}"
+                if heavy:
+                    msg += f" nu={nu:.2f} var_corr={int(heavy_var_correction)}"
+
+                # (2) Optional baseline Gaussian reference tail (same shape, global)
+                if sanity_compare_ref:
+                    g_ref = torch.randn_like(noise)
+                    ref_tail = g_ref.detach().abs().reshape(-1).quantile(sanity_q)
+                    ratio = (noise_tail / (ref_tail + 1e-12)).item()
+                    msg += f" | ref_gauss(all)={float(ref_tail):.6g} | ratio={ratio:.3f}"
+
+                # (3) Confirm q_sample used provided noise:
+                # x = sqrt_ab*x0 + sqrt_1mab*noise => recon_noise ≈ noise
+                sqrt_ab = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+                sqrt_1mab = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+                recon_noise = (x.detach() - sqrt_ab * x_start.detach()) / (sqrt_1mab + 1e-12)
+                recon_diff = (recon_noise - noise.detach()).abs().mean()
+                msg += f" | recon_diff={float(recon_diff):.3e}"
+
+                # (4) Optional: tail of x_t itself (this is what actually hits the network)
+                if sanity_check_xt:
+                    abs_xt_all = x.detach().abs().reshape(-1)
+                    xt_tail = abs_xt_all.quantile(sanity_q)
+                    msg += f" | |x_t|_q(all)={float(xt_tail):.6g}"
+
+                    if sanity_compare_ref:
+                        # Construct a "gaussian x_t reference" with the SAME coefficients but gaussian noise
+                        g = torch.randn_like(noise)
+                        x_gauss = sqrt_ab * x_start.detach() + sqrt_1mab * g
+                        xt_ref_tail = x_gauss.abs().reshape(-1).quantile(sanity_q)
+                        xt_ratio = (xt_tail / (xt_ref_tail + 1e-12)).item()
+                        msg += f" | x_t_ref_gauss_q={float(xt_ref_tail):.6g} | xt_ratio={xt_ratio:.3f}"
+
+                print(msg)
+        # =========================
+        # END SANITY CHECK
+        # =========================
+
+        # -------------------------
+        # (D) Model forward + losses
+        # -------------------------
+        model_out = self.output(x, t, padding_masks)
         train_loss = self.loss_fn(model_out, target, reduction='none')
 
-        fourier_loss = torch.tensor([0.])
+        # Optional Fourier loss (unchanged)
         if self.use_ff:
             fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
             fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
             fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
-            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
-                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss +=  self.ff_weight * fourier_loss
-        
+
+            fourier_loss = (
+                    self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')
+                    + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
+            )
+            train_loss = train_loss + self.ff_weight * fourier_loss
+
+        # Reduce & apply per-timestep weighting (unchanged)
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
         train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
+
         return train_loss.mean()
+
+
 
     def forward(self, x, **kwargs):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
@@ -285,233 +423,6 @@ class Diffusion_TS(nn.Module):
         x = self.q_sample(x, t)
         trend, season, residual = self.model(x, t, return_res=True)
         return trend, season, residual, x
-
-    def fast_sample_infill(self, shape, target, sampling_timesteps, partial_mask=None, clip_denoised=True, model_kwargs=None):
-        batch, device, total_timesteps, eta = shape[0], self.betas.device, self.num_timesteps, self.eta
-
-        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-        img = torch.randn(shape, device=device)
-
-        for time, time_next in tqdm(time_pairs, desc='conditional sampling loop time step'):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised)
-
-            if time_next < 0:
-                img = x_start
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-            pred_mean = x_start * alpha_next.sqrt() + c * pred_noise
-            noise = torch.randn_like(img)
-
-            img = pred_mean + sigma * noise
-            img = self.langevin_fn(sample=img, mean=pred_mean, sigma=sigma, t=time_cond,
-                                   tgt_embs=target, partial_mask=partial_mask, **model_kwargs)
-            target_t = self.q_sample(target, t=time_cond)
-            img[partial_mask] = target_t[partial_mask]
-
-        img[partial_mask] = target[partial_mask]
-
-        return img
-
-    def sample_infill(
-        self,
-        shape, 
-        target,
-        partial_mask=None,
-        clip_denoised=True,
-        model_kwargs=None,
-    ):
-        """
-        Generate samples from the model and yield intermediate samples from
-        each timestep of diffusion.
-        """
-        batch, device = shape[0], self.betas.device
-        img = torch.randn(shape, device=device)
-        for t in tqdm(reversed(range(0, self.num_timesteps)),
-                      desc='conditional sampling loop time step', total=self.num_timesteps):
-            img = self.p_sample_infill(x=img, t=t, clip_denoised=clip_denoised, target=target,
-                                       partial_mask=partial_mask, model_kwargs=model_kwargs)
-        
-        img[partial_mask] = target[partial_mask]
-        return img
-    
-    def p_sample_infill(
-        self,
-        x,
-        target,
-        t: int,
-        partial_mask=None,
-        clip_denoised=True,
-        model_kwargs=None
-    ):
-        b, *_, device = *x.shape, self.betas.device
-        batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
-        model_mean, _, model_log_variance, _ = \
-            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised)
-        noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
-        sigma = (0.5 * model_log_variance).exp()
-        pred_img = model_mean + sigma * noise
-
-        pred_img = self.langevin_fn(sample=pred_img, mean=model_mean, sigma=sigma, t=batched_times,
-                                    tgt_embs=target, partial_mask=partial_mask, **model_kwargs)
-        
-        target_t = self.q_sample(target, t=batched_times)
-        pred_img[partial_mask] = target_t[partial_mask]
-
-        return pred_img
-
-    def langevin_fn(
-        self,
-        coef,
-        partial_mask,
-        tgt_embs,
-        learning_rate,
-        sample,
-        mean,
-        sigma,
-        t,
-        coef_=0.
-    ):
-    
-        if t[0].item() < self.num_timesteps * 0.05:
-            K = 0
-        elif t[0].item() > self.num_timesteps * 0.9:
-            K = 3
-        elif t[0].item() > self.num_timesteps * 0.75:
-            K = 2
-            learning_rate = learning_rate * 0.5
-        else:
-            K = 1
-            learning_rate = learning_rate * 0.25
-
-        input_embs_param = torch.nn.Parameter(sample)
-
-        with torch.enable_grad():
-            for i in range(K):
-                optimizer = torch.optim.Adagrad([input_embs_param], lr=learning_rate)
-                optimizer.zero_grad()
-
-                x_start = self.output(x=input_embs_param, t=t)
-
-                if sigma.mean() == 0:
-                    logp_term = coef * ((mean - input_embs_param) ** 2 / 1.).mean(dim=0).sum()
-                    infill_loss = (x_start[partial_mask] - tgt_embs[partial_mask]) ** 2
-                    infill_loss = infill_loss.mean(dim=0).sum()
-                else:
-                    logp_term = coef * ((mean - input_embs_param)**2 / sigma).mean(dim=0).sum()
-                    infill_loss = (x_start[partial_mask] - tgt_embs[partial_mask]) ** 2
-                    infill_loss = (infill_loss/sigma.mean()).mean(dim=0).sum()
-            
-                loss = logp_term + infill_loss
-                loss.backward()
-                optimizer.step()
-                epsilon = torch.randn_like(input_embs_param.data)
-                input_embs_param = torch.nn.Parameter((input_embs_param.data + coef_ * sigma.mean().item() * epsilon).detach())
-
-        sample[~partial_mask] = input_embs_param.data[~partial_mask]
-        return sample
-    
-    def condition_mean(self, cond_fn, mean, log_variance, x, t, model_kwargs=None):
-        """
-        Compute the mean for the previous step, given a function cond_fn that
-        computes the gradient of a conditional log probability with respect to
-        x. In particular, cond_fn computes grad(log(p(y|x))), and we want to
-        condition on y.
-
-        This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
-        """
-        gradient = cond_fn(x=x, t=t, **model_kwargs)
-        new_mean = (
-            mean.float() + torch.exp(log_variance) * gradient.float()
-        )
-        return new_mean
-    
-    def condition_score(self, cond_fn, x_start, x, t, model_kwargs=None):
-        """
-        Compute what the p_mean_variance output would have been, should the
-        model's score function be conditioned by cond_fn.
-
-        See condition_mean() for details on cond_fn.
-
-        Unlike condition_mean(), this instead uses the conditioning strategy
-        from Song et al (2020).
-        """
-        alpha_bar = extract(self.alphas_cumprod, t, x.shape)
-
-        eps = self.predict_noise_from_start(x, t, x_start)
-        eps = eps - (1 - alpha_bar).sqrt() * cond_fn(x, t, **model_kwargs)
-
-        pred_xstart = self.predict_start_from_noise(x, t, eps)
-        model_mean, _, _ = self.q_posterior(x_start=pred_xstart, x_t=x, t=t)
-        return model_mean, pred_xstart
-    
-    def sample_cond(
-        self,
-        shape,
-        clip_denoised=True,
-        model_kwargs=None,
-        cond_fn=None
-    ):
-        """
-        Generate samples from the model and yield intermediate samples from
-        each timestep of diffusion.
-        """
-        batch, device = shape[0], self.betas.device
-        img = torch.randn(shape, device=device)
-        for t in tqdm(reversed(range(0, self.num_timesteps)),
-                      desc='sampling loop time step', total=self.num_timesteps):
-            img, x_start = self.p_sample(img, t, clip_denoised=clip_denoised, cond_fn=cond_fn,
-                                         model_kwargs=model_kwargs)
-        return img
-
-    def fast_sample_cond(
-        self,
-        shape,
-        clip_denoised=True,
-        model_kwargs=None,
-        cond_fn=None
-    ):
-        batch, device, total_timesteps, sampling_timesteps, eta = \
-            shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
-
-        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-        img = torch.randn(shape, device=device)
-        x_start = None
-
-        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, clip_x_start=clip_denoised)
-
-            if cond_fn is not None:
-                _, x_start = self.condition_score(cond_fn, x_start, img, time_cond, model_kwargs=model_kwargs)
-                pred_noise = self.predict_noise_from_start(img, time_cond, x_start)
-
-            if time_next < 0:
-                img = x_start
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-            noise = torch.randn_like(img)
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
-
-        return img
 
 
 if __name__ == '__main__':
